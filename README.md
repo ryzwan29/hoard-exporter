@@ -1,27 +1,27 @@
-# hoard-exporter
+# Hoard Exporter
+
+Prometheus exporter for [Hoard](https://github.com/rleeon/hoard) — the open-source, versioned game save backup and sync system. This exporter polls your `hoard-server` instance and exposes its health and usage data as Prometheus metrics, so you can monitor your self-hosted Hoard deployment (storage usage, orphaned objects, per-user quotas, uptime, etc.) in Grafana or any Prometheus-compatible stack.
+
+![Grafana Dashboard](images/grafana-dashboard.png)
 
 ## Setup
 
 1. Create an admin device token through the Hoard web dashboard (`Users` -> create a new token under an admin account), or via the shell:
 
-   ```bash
+   ```
    hoard-admin token create <admin-user> --device exporter
    ```
-
 2. Create a `.env` file alongside your Compose file:
 
-   ```env
+   ```
    HOARD_EXPORTER_TOKEN=hoard_v1_xxxxxxxx
    ```
-
 3. Add the contents of `docker-compose.snippet.yml` to your existing Hoard Compose stack. Adjust the `server` service name if yours is different.
-
 4. Start the exporter:
 
-   ```bash
+   ```
    docker compose up -d --build hoard-exporter
    ```
-
 5. Add the following scrape configuration to your Prometheus/VictoriaMetrics configuration:
 
    ```yaml
@@ -32,20 +32,13 @@
 
 ## Configuration (Environment Variables)
 
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `HOARD_URL` | Yes | - | Base URL of hoard-server, e.g. `http://server:12421` |
-| `HOARD_TOKEN` | Yes | - | Admin device token (`hoard_v1_...`) |
-| `LISTEN_ADDR` | No | `:9477` | Address the exporter listens on |
-| `SCRAPE_INTERVAL` | No | `15s` | Polling interval for hoard-server (not the Prometheus scrape interval — the exporter caches results to avoid hitting the database on every Prometheus scrape) |
-| `HOARD_TIMEOUT` | No | `10s` | Timeout for each request to hoard-server |
-| `HOARD_MINT_USER_TOKENS` | No | - | `true` = mint a `hoard-exporter` device token per user via the admin API, for per-game metrics (see below) |
-| `HOARD_STATE_FILE` | No | `/data/hoard-exporter-tokens.json` | Where minted tokens are stored (mount `/data` as a volume) |
-| `HOARD_USER_TOKENS` | No | - | Manual alternative: `alice=hoard_v1_xxx,bob=hoard_v1_yyy` |
-
-## Per-game metrics
-
-`/v1/me/overview` and `/v1/playtime` are scoped to the calling token's own user, so an admin token can't read other users' games. Per-game metrics need one token per user: either `HOARD_USER_TOKENS`, or `HOARD_MINT_USER_TOKENS=true` (admin token mints them; they show up as device `hoard-exporter` in each user's device list and can be revoked from the dashboard). Neither set = no per-game metrics, everything else works as before.
+| Variable          | Required | Default | Description                                                                                                                                                   |
+|-------------------|----------|---------|-----------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `HOARD_URL`       | Yes      | -       | Base URL of hoard-server, e.g. `http://server:12421`                                                                                                        |
+| `HOARD_TOKEN`     | Yes      | -       | Admin device token (`hoard_v1_...`)                                                                                                                         |
+| `LISTEN_ADDR`     | No       | `:9477` | Address the exporter listens on                                                                                                                             |
+| `SCRAPE_INTERVAL` | No       | `15s`   | Polling interval for hoard-server (not the Prometheus scrape interval — the exporter caches results to avoid hitting the database on every Prometheus scrape) |
+| `HOARD_TIMEOUT`   | No       | `10s`   | Timeout for each request to hoard-server                                                                                                                    |
 
 ## Exposed Metrics
 
@@ -73,29 +66,11 @@
   - `hoard_user_devices_total`
   - `hoard_user_last_seen_timestamp_seconds`
 
-### Per-game (needs per-user tokens, see above)
-
-- `hoard_user_game_scrape_success{username}` — 1/0
-- `hoard_user_playtime_seconds{username}`, `hoard_user_games_total{username}`
-- Labels `{username, game, game_name}`:
-  - `hoard_user_game_playtime_seconds`
-  - `hoard_user_game_saves`, `hoard_user_game_versions`, `hoard_user_game_bytes`
-  - `hoard_user_game_last_backup_timestamp_seconds`
-
-```
-# most played games (hours)
-topk(10, sum by (game_name) (hoard_user_game_playtime_seconds)) / 3600
-# players per game
-count by (game_name) (hoard_user_game_playtime_seconds > 0)
-# save data growth per game (24h)
-topk(10, sum by (game_name) (delta(hoard_user_game_bytes[24h])))
-```
-
 Missing timestamps (`null` in JSON, e.g. for users who have never logged in) are represented as `-1` instead of `0`, so they cannot be confused with a real Unix epoch timestamp (January 1, 1970).
 
 ## Example PromQL Alerts
 
-```promql
+```
 # Server down
 up{job="hoard"} == 0 or hoard_up == 0
 
@@ -109,7 +84,7 @@ hoard_user_quota_bytes > 0
 
 ## Development / Manual Build
 
-```bash
+```
 go build -o hoard-exporter .
 HOARD_URL=http://IP:12421 HOARD_TOKEN=hoard_v1_... ./hoard-exporter
 ```
