@@ -33,7 +33,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Metadata (tag otomatis: latest, branch, git sha, semver dari tag)
+      - name: "Metadata (tag otomatis - latest, branch, git sha, semver)"
         id: meta
         uses: docker/metadata-action@v5
         with:
