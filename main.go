@@ -11,13 +11,16 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"math"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,26 +30,39 @@ import (
 // ---- Config ---------------------------------------------------------------
 
 type config struct {
-	baseURL  string        // e.g. http://hoard-server:12421 (no trailing slash)
-	token    string        // admin device token, "hoard_v1_..."
-	listen   string        // exporter's own listen address, e.g. ":9477"
-	interval time.Duration // how often to poll hoard-server
-	timeout  time.Duration // HTTP client timeout per request
+	baseURL    string            // e.g. http://hoard-server:12421 (no trailing slash)
+	token      string            // admin device token, "hoard_v1_..."
+	listen     string            // exporter's own listen address, e.g. ":9477"
+	interval   time.Duration     // how often to poll hoard-server
+	timeout    time.Duration     // HTTP client timeout per request
+	userTokens map[string]string // username -> that user's own device token (HOARD_USER_TOKENS)
+	mint       bool              // mint per-user tokens through the admin API (HOARD_MINT_USER_TOKENS)
+	stateFile  string            // where minted tokens are persisted
 }
 
 func loadConfig() config {
 	c := config{
-		baseURL:  strings.TrimRight(getenv("HOARD_URL", ""), "/"),
-		token:    getenv("HOARD_TOKEN", ""),
-		listen:   getenv("LISTEN_ADDR", ":9477"),
-		interval: getenvDuration("SCRAPE_INTERVAL", 15*time.Second),
-		timeout:  getenvDuration("HOARD_TIMEOUT", 10*time.Second),
+		baseURL:    strings.TrimRight(getenv("HOARD_URL", ""), "/"),
+		token:      getenv("HOARD_TOKEN", ""),
+		listen:     getenv("LISTEN_ADDR", ":9477"),
+		interval:   getenvDuration("SCRAPE_INTERVAL", 15*time.Second),
+		timeout:    getenvDuration("HOARD_TIMEOUT", 10*time.Second),
+		userTokens: map[string]string{},
+		mint:       getenv("HOARD_MINT_USER_TOKENS", "") == "true",
+		stateFile:  getenv("HOARD_STATE_FILE", "/data/hoard-exporter-tokens.json"),
 	}
 	if c.baseURL == "" {
 		log.Fatal("HOARD_URL is required, e.g. http://hoard-server:12421")
 	}
 	if c.token == "" {
 		log.Fatal("HOARD_TOKEN is required (an admin device token, hoard_v1_...)")
+	}
+	// HOARD_USER_TOKENS="alice=hoard_v1_aaa,bob=hoard_v1_bbb"
+	for _, kv := range strings.Split(getenv("HOARD_USER_TOKENS", ""), ",") {
+		name, tok, ok := strings.Cut(strings.TrimSpace(kv), "=")
+		if ok && name != "" && tok != "" {
+			c.userTokens[name] = tok
+		}
 	}
 	return c
 }
@@ -119,6 +135,48 @@ type userRow struct {
 	CreatedAt   string  `json:"created_at"`
 }
 
+// Per-user shapes (routes/overview.rs GameRow, routes/playtime.rs
+// PlaytimeAggregate). Unlike /v1/admin/overview these are scoped to the bearer
+// token's own user, so reading a user's games needs that user's token.
+
+type meOverview struct {
+	Games []meGame `json:"games"`
+}
+
+type meGame struct {
+	Slug         string  `json:"slug"`
+	DisplayName  string  `json:"display_name"`
+	Saves        int64   `json:"saves"`
+	Versions     int64   `json:"versions"`
+	Bytes        int64   `json:"bytes"`
+	LastBackupAt *string `json:"last_backup_at"`
+}
+
+type playtimeAgg struct {
+	ByGame    map[string]uint64 `json:"by_game"`
+	TotalSecs uint64            `json:"total_secs"`
+}
+
+// gameStat is one (user, game) row after merging /v1/me/overview with
+// /v1/playtime. A game can have playtime without any save and vice versa.
+type gameStat struct {
+	slug, name   string
+	saves        int64
+	versions     int64
+	bytes        int64
+	lastBackupAt *string
+	playSecs     uint64
+}
+
+// userData is one user's per-game scrape result.
+type userData struct {
+	username  string
+	skipped   bool // no token available for this user: emit nothing
+	err       string
+	totalSecs uint64
+	games     []gameStat
+}
+
 // ---- Scraper ----------------------------------------------------------------
 
 // snapshot is the latest successfully-parsed state, served to every /metrics
@@ -128,6 +186,7 @@ type snapshot struct {
 	version       string
 	uptimeSecs    uint64
 	overview      *adminOverview // nil if the admin call failed or hasn't succeeded yet
+	users         []userData     // per-user game/playtime data, same order as overview.Users
 	lastScrapeErr string
 	lastScrapeAt  time.Time
 }
@@ -138,22 +197,56 @@ type scraper struct {
 
 	mu   sync.RWMutex
 	snap snapshot
+
+	minMu  sync.Mutex
+	minted map[string]string // user id -> minted device token
 }
 
 func newScraper(cfg config) *scraper {
-	return &scraper{
+	s := &scraper{
 		cfg:    cfg,
 		client: &http.Client{Timeout: cfg.timeout},
+		minted: map[string]string{},
 	}
+	if cfg.mint {
+		if b, err := os.ReadFile(cfg.stateFile); err == nil {
+			if err := json.Unmarshal(b, &s.minted); err != nil {
+				log.Printf("warn: %s is not valid JSON, starting with no minted tokens: %v", cfg.stateFile, err)
+			}
+		}
+	}
+	return s
 }
 
+type httpError struct {
+	status int
+	msg    string
+}
+
+func (e *httpError) Error() string { return e.msg }
+
 func (s *scraper) get(path string, out any) error {
-	req, err := http.NewRequest(http.MethodGet, s.cfg.baseURL+path, nil)
+	return s.call(http.MethodGet, path, s.cfg.token, nil, out)
+}
+
+func (s *scraper) call(method, path, token string, in, out any) error {
+	var rd io.Reader
+	if in != nil {
+		b, err := json.Marshal(in)
+		if err != nil {
+			return err
+		}
+		rd = bytes.NewReader(b)
+	}
+	req, err := http.NewRequest(method, s.cfg.baseURL+path, rd)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+s.cfg.token)
+	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Accept", "application/json")
+	if in != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 
 	resp, err := s.client.Do(req)
 	if err != nil {
@@ -165,14 +258,121 @@ func (s *scraper) get(path string, out any) error {
 	if err != nil {
 		return err
 	}
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		snippet := string(body)
 		if len(snippet) > 200 {
 			snippet = snippet[:200]
 		}
-		return fmt.Errorf("%s: unexpected status %d: %s", path, resp.StatusCode, snippet)
+		return &httpError{resp.StatusCode, fmt.Sprintf("%s: unexpected status %d: %s", path, resp.StatusCode, snippet)}
 	}
 	return json.Unmarshal(body, out)
+}
+
+var errNoToken = errors.New("no token for user")
+
+// tokenFor returns the token to read this user's own data with: an explicit
+// HOARD_USER_TOKENS entry first, else (opt-in) a device token minted through
+// POST /v1/admin/tokens and persisted so a restart doesn't mint another one.
+func (s *scraper) tokenFor(u userRow) (tok string, minted bool, err error) {
+	if t, ok := s.cfg.userTokens[u.Username]; ok {
+		return t, false, nil
+	}
+	if !s.cfg.mint {
+		return "", false, errNoToken
+	}
+	s.minMu.Lock()
+	defer s.minMu.Unlock()
+	if t, ok := s.minted[u.ID]; ok {
+		return t, true, nil
+	}
+	var out struct {
+		Token string `json:"token"`
+	}
+	in := map[string]string{"user_id": u.ID, "device_name": "hoard-exporter"}
+	if err := s.call(http.MethodPost, "/v1/admin/tokens", s.cfg.token, in, &out); err != nil {
+		return "", false, fmt.Errorf("mint token: %w", err)
+	}
+	if out.Token == "" {
+		return "", false, errors.New("mint token: empty token in response")
+	}
+	s.minted[u.ID] = out.Token
+	s.saveMintedLocked()
+	log.Printf("minted a device token for user %q (device name: hoard-exporter)", u.Username)
+	return out.Token, true, nil
+}
+
+func (s *scraper) dropMinted(id string) {
+	s.minMu.Lock()
+	defer s.minMu.Unlock()
+	delete(s.minted, id)
+	s.saveMintedLocked()
+}
+
+func (s *scraper) saveMintedLocked() {
+	b, err := json.Marshal(s.minted)
+	if err != nil {
+		return
+	}
+	tmp := s.cfg.stateFile + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		log.Printf("warn: cannot persist minted tokens to %s (will re-mint on restart): %v", s.cfg.stateFile, err)
+		return
+	}
+	if err := os.Rename(tmp, s.cfg.stateFile); err != nil {
+		log.Printf("warn: cannot persist minted tokens to %s: %v", s.cfg.stateFile, err)
+	}
+}
+
+// collectUser reads one user's games and playtime with that user's own token.
+func (s *scraper) collectUser(u userRow) userData {
+	d := userData{username: u.Username}
+	tok, minted, err := s.tokenFor(u)
+	if errors.Is(err, errNoToken) {
+		d.skipped = true
+		return d
+	}
+	if err == nil {
+		var mo meOverview
+		var pt playtimeAgg
+		if err = s.call(http.MethodGet, "/v1/me/overview", tok, nil, &mo); err == nil {
+			err = s.call(http.MethodGet, "/v1/playtime", tok, nil, &pt)
+		}
+		if err == nil {
+			d.totalSecs = pt.TotalSecs
+			d.games = mergeGames(mo.Games, pt.ByGame)
+			return d
+		}
+		var he *httpError
+		if minted && errors.As(err, &he) && (he.status == 401 || he.status == 403) {
+			s.dropMinted(u.ID) // expired or revoked: mint a fresh one next poll
+		}
+	}
+	d.err = err.Error()
+	return d
+}
+
+func mergeGames(games []meGame, play map[string]uint64) []gameStat {
+	by := map[string]*gameStat{}
+	for _, g := range games {
+		name := g.DisplayName
+		if name == "" {
+			name = g.Slug
+		}
+		by[g.Slug] = &gameStat{slug: g.Slug, name: name, saves: g.Saves, versions: g.Versions, bytes: g.Bytes, lastBackupAt: g.LastBackupAt}
+	}
+	for slug, secs := range play {
+		if g, ok := by[slug]; ok {
+			g.playSecs = secs
+		} else {
+			by[slug] = &gameStat{slug: slug, name: slug, playSecs: secs}
+		}
+	}
+	out := make([]gameStat, 0, len(by))
+	for _, g := range by {
+		out = append(out, *g)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].slug < out[j].slug })
+	return out
 }
 
 // poll runs one scrape cycle and updates the snapshot. It never panics the
@@ -205,6 +405,17 @@ func (s *scraper) poll() {
 		return
 	}
 	next.overview = &ov
+
+	// Per-user games and playtime. One failing user never blocks the others.
+	if len(s.cfg.userTokens) > 0 || s.cfg.mint {
+		for _, u := range ov.Users {
+			d := s.collectUser(u)
+			if d.err != "" {
+				log.Printf("user %q games/playtime scrape failed: %s", u.Username, d.err)
+			}
+			next.users = append(next.users, d)
+		}
+	}
 	s.commit(next)
 }
 
@@ -359,6 +570,29 @@ func renderMetrics(snap snapshot) string {
 		w.gauge("hoard_user_versions_total", "Non-trashed versions belonging to this user.", float64(u.Versions), labels)
 		w.gauge("hoard_user_devices_total", "Machines registered to this user (online + offline).", float64(u.Devices), labels)
 		w.gauge("hoard_user_last_seen_timestamp_seconds", "Last heartbeat from any of this user's devices, -1 if never seen.", unixSeconds(u.LastSeenAt), labels)
+	}
+
+	// Per-game / per-playtime metrics. Rankings, per-game totals and growth are
+	// PromQL over these (topk, sum by (game), delta), not computed here.
+	for _, d := range snap.users {
+		if d.skipped {
+			continue
+		}
+		ul := map[string]string{"username": d.username}
+		w.gauge("hoard_user_game_scrape_success", "1 if this user's games/playtime were read on the last scrape, else 0.", boolToFloat(d.err == ""), ul)
+		if d.err != "" {
+			continue
+		}
+		w.gauge("hoard_user_playtime_seconds", "All-time play time of this user, including time not attributed to a game.", float64(d.totalSecs), ul)
+		w.gauge("hoard_user_games_total", "Games this user has a save or play time for.", float64(len(d.games)), ul)
+		for _, g := range d.games {
+			gl := map[string]string{"username": d.username, "game": g.slug, "game_name": g.name}
+			w.gauge("hoard_user_game_playtime_seconds", "All-time play time of this user in this game.", float64(g.playSecs), gl)
+			w.gauge("hoard_user_game_saves", "Save slots this user has for this game.", float64(g.saves), gl)
+			w.gauge("hoard_user_game_versions", "Non-trashed versions this user has for this game.", float64(g.versions), gl)
+			w.gauge("hoard_user_game_bytes", "Logical (pre-dedup) bytes of this user's versions of this game.", float64(g.bytes), gl)
+			w.gauge("hoard_user_game_last_backup_timestamp_seconds", "Time of this user's last backup of this game, -1 if none.", unixSeconds(g.lastBackupAt), gl)
+		}
 	}
 
 	return w.b.String()

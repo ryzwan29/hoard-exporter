@@ -8,5 +8,12 @@ services:
       HOARD_TOKEN: "${HOARD_EXPORTER_TOKEN}"
       LISTEN_ADDR: ":9477"
       SCRAPE_INTERVAL: "30s"
+      HOARD_MINT_USER_TOKENS: "true"   # per-game metrics
+      HOARD_STATE_FILE: "/data/hoard-exporter-tokens.json"
+    volumes:
+      - hoard-exporter-data:/data
     ports:
       - "9477:9477"
+
+volumes:
+  hoard-exporter-data:

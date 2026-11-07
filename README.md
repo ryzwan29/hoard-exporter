@@ -39,6 +39,13 @@
 | `LISTEN_ADDR` | No | `:9477` | Address the exporter listens on |
 | `SCRAPE_INTERVAL` | No | `15s` | Polling interval for hoard-server (not the Prometheus scrape interval — the exporter caches results to avoid hitting the database on every Prometheus scrape) |
 | `HOARD_TIMEOUT` | No | `10s` | Timeout for each request to hoard-server |
+| `HOARD_MINT_USER_TOKENS` | No | - | `true` = mint a `hoard-exporter` device token per user via the admin API, for per-game metrics (see below) |
+| `HOARD_STATE_FILE` | No | `/data/hoard-exporter-tokens.json` | Where minted tokens are stored (mount `/data` as a volume) |
+| `HOARD_USER_TOKENS` | No | - | Manual alternative: `alice=hoard_v1_xxx,bob=hoard_v1_yyy` |
+
+## Per-game metrics
+
+`/v1/me/overview` and `/v1/playtime` are scoped to the calling token's own user, so an admin token can't read other users' games. Per-game metrics need one token per user: either `HOARD_USER_TOKENS`, or `HOARD_MINT_USER_TOKENS=true` (admin token mints them; they show up as device `hoard-exporter` in each user's device list and can be revoked from the dashboard). Neither set = no per-game metrics, everything else works as before.
 
 ## Exposed Metrics
 
@@ -65,6 +72,24 @@
   - `hoard_user_versions_total`
   - `hoard_user_devices_total`
   - `hoard_user_last_seen_timestamp_seconds`
+
+### Per-game (needs per-user tokens, see above)
+
+- `hoard_user_game_scrape_success{username}` — 1/0
+- `hoard_user_playtime_seconds{username}`, `hoard_user_games_total{username}`
+- Labels `{username, game, game_name}`:
+  - `hoard_user_game_playtime_seconds`
+  - `hoard_user_game_saves`, `hoard_user_game_versions`, `hoard_user_game_bytes`
+  - `hoard_user_game_last_backup_timestamp_seconds`
+
+```
+# most played games (hours)
+topk(10, sum by (game_name) (hoard_user_game_playtime_seconds)) / 3600
+# players per game
+count by (game_name) (hoard_user_game_playtime_seconds > 0)
+# save data growth per game (24h)
+topk(10, sum by (game_name) (delta(hoard_user_game_bytes[24h])))
+```
 
 Missing timestamps (`null` in JSON, e.g. for users who have never logged in) are represented as `-1` instead of `0`, so they cannot be confused with a real Unix epoch timestamp (January 1, 1970).
 
