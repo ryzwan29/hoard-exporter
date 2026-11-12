@@ -25,7 +25,12 @@ import (
 	"strings"
 	"sync"
 	"time"
+	_ "time/tzdata" 
 )
+
+// dayLoc is the timezone used to turn a Hoard day key ("2026-11-12") into the
+// unix time of that day's 00:00. Set from HOARD_DAY_TZ in loadConfig.
+var dayLoc = time.UTC
 
 // ---- Config ---------------------------------------------------------------
 
@@ -64,6 +69,11 @@ func loadConfig() config {
 			c.userTokens[name] = tok
 		}
 	}
+	loc, err := time.LoadLocation(getenv("HOARD_DAY_TZ", "Asia/Jakarta"))
+	if err != nil {
+		log.Fatalf("HOARD_DAY_TZ invalid: %v", err)
+	}
+	dayLoc = loc
 	return c
 }
 
@@ -153,8 +163,10 @@ type meGame struct {
 }
 
 type playtimeAgg struct {
-	ByGame    map[string]uint64 `json:"by_game"`
-	TotalSecs uint64            `json:"total_secs"`
+	ByGame      map[string]uint64            `json:"by_game"`
+	TotalSecs   uint64                       `json:"total_secs"`
+	Days        map[string]uint64            `json:"days"`          // "YYYY-MM-DD" -> seconds
+	DailyByGame map[string]map[string]uint64 `json:"daily_by_game"` // "YYYY-MM-DD" -> slug -> seconds
 }
 
 // gameStat is one (user, game) row after merging /v1/me/overview with
@@ -175,6 +187,9 @@ type userData struct {
 	err       string
 	totalSecs uint64
 	games     []gameStat
+
+	days        map[string]uint64
+	dailyByGame map[string]map[string]uint64
 }
 
 // ---- Scraper ----------------------------------------------------------------
@@ -340,6 +355,8 @@ func (s *scraper) collectUser(u userRow) userData {
 		if err == nil {
 			d.totalSecs = pt.TotalSecs
 			d.games = mergeGames(mo.Games, pt.ByGame)
+			d.days = pt.Days
+			d.dailyByGame = pt.DailyByGame
 			return d
 		}
 		var he *httpError
@@ -572,8 +589,9 @@ func renderMetrics(snap snapshot) string {
 		w.gauge("hoard_user_last_seen_timestamp_seconds", "Last heartbeat from any of this user's devices, -1 if never seen.", unixSeconds(u.LastSeenAt), labels)
 	}
 
-	// Per-game / per-playtime metrics. Rankings, per-game totals and growth are
-	// PromQL over these (topk, sum by (game), delta), not computed here.
+	// Per-game / per-playtime metrics. Rankings and per-game totals are
+	// PromQL over these (topk, sum by (game)), not computed here.
+	dates := map[string]bool{}
 	for _, d := range snap.users {
 		if d.skipped {
 			continue
@@ -592,6 +610,35 @@ func renderMetrics(snap snapshot) string {
 			w.gauge("hoard_user_game_versions", "Non-trashed versions this user has for this game.", float64(g.versions), gl)
 			w.gauge("hoard_user_game_bytes", "Logical (pre-dedup) bytes of this user's versions of this game.", float64(g.bytes), gl)
 			w.gauge("hoard_user_game_last_backup_timestamp_seconds", "Time of this user's last backup of this game, -1 if none.", unixSeconds(g.lastBackupAt), gl)
+		}
+
+		// Per-day playtime, straight from Hoard's own "days" / "daily_by_game"
+		// so the day buckets match the Hoard dashboard exactly.
+		names := map[string]string{}
+		for _, g := range d.games {
+			names[g.slug] = g.name
+		}
+		for date, secs := range d.days {
+			dates[date] = true
+			w.gauge("hoard_user_playtime_day_seconds", "Play time of this user on this calendar day.", float64(secs), map[string]string{"username": d.username, "date": date})
+		}
+		for date, games := range d.dailyByGame {
+			dates[date] = true
+			for slug, secs := range games {
+				name := names[slug]
+				if name == "" {
+					name = slug
+				}
+				w.gauge("hoard_user_game_playtime_day_seconds", "Play time of this user in this game on this calendar day.", float64(secs), map[string]string{"username": d.username, "game": slug, "game_name": name, "date": date})
+			}
+		}
+	}
+
+	// Unix time of 00:00 for each date label, so Grafana can filter day buckets
+	// by the dashboard time range.
+	for date := range dates {
+		if t, err := time.ParseInLocation("2006-01-02", date, dayLoc); err == nil {
+			w.gauge("hoard_playtime_day_start_timestamp_seconds", "Unix time of 00:00 of the date label (HOARD_DAY_TZ).", float64(t.Unix()), map[string]string{"date": date})
 		}
 	}
 
