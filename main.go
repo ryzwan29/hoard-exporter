@@ -25,7 +25,7 @@ import (
 	"strings"
 	"sync"
 	"time"
-	_ "time/tzdata" 
+	_ "time/tzdata" // embed tz database so HOARD_DAY_TZ works in minimal/scratch images
 )
 
 // dayLoc is the timezone used to turn a Hoard day key ("2026-11-12") into the
@@ -618,18 +618,49 @@ func renderMetrics(snap snapshot) string {
 		for _, g := range d.games {
 			names[g.slug] = g.name
 		}
-		for date, secs := range d.days {
-			dates[date] = true
-			w.gauge("hoard_user_playtime_day_seconds", "Play time of this user on this calendar day.", float64(secs), map[string]string{"username": d.username, "date": date})
+		// Hoard only returns days that have playtime. Fill every day from the
+		// first recorded one up to today (HOARD_DAY_TZ) with explicit zeros so
+		// idle days still show up as empty bars. Per-game zeros are only
+		// emitted for games that have been played at least once.
+		first, last := "", ""
+		note := func(date string) {
+			if first == "" || date < first {
+				first = date
+			}
+			if date > last {
+				last = date
+			}
 		}
+		for date := range d.days {
+			note(date)
+		}
+		played := map[string]bool{}
 		for date, games := range d.dailyByGame {
-			dates[date] = true
-			for slug, secs := range games {
-				name := names[slug]
-				if name == "" {
-					name = slug
+			note(date)
+			for slug := range games {
+				played[slug] = true
+			}
+		}
+		if first != "" {
+			if today := time.Now().In(dayLoc).Format("2006-01-02"); today > last {
+				last = today
+			}
+			if t, err := time.ParseInLocation("2006-01-02", first, dayLoc); err == nil {
+				for i := 0; i < 3660; i++ {
+					date := t.AddDate(0, 0, i).Format("2006-01-02")
+					if date > last {
+						break
+					}
+					dates[date] = true
+					w.gauge("hoard_user_playtime_day_seconds", "Play time of this user on this calendar day (0 for idle days).", float64(d.days[date]), map[string]string{"username": d.username, "date": date})
+					for slug := range played {
+						name := names[slug]
+						if name == "" {
+							name = slug
+						}
+						w.gauge("hoard_user_game_playtime_day_seconds", "Play time of this user in this game on this calendar day (0 for idle days).", float64(d.dailyByGame[date][slug]), map[string]string{"username": d.username, "game": slug, "game_name": name, "date": date})
+					}
 				}
-				w.gauge("hoard_user_game_playtime_day_seconds", "Play time of this user in this game on this calendar day.", float64(secs), map[string]string{"username": d.username, "game": slug, "game_name": name, "date": date})
 			}
 		}
 	}
