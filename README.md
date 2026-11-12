@@ -8,6 +8,8 @@ A Prometheus exporter for a self-hosted [Hoard](https://github.com) server. It s
 
 > **Note:** `/v1/admin/overview` is an internal, undocumented endpoint (reverse-engineered from the hoard-server source). A new Hoard release may change its shape without notice.
 
+![Grafana Dashboard](images/grafana-dashboard.png)
+
 ## Features
 
 - Server health, version and uptime
